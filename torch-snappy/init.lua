@@ -99,7 +99,8 @@ local lib = ffi.load("snappy")
 local snappy = {}
 
 local function data_size(tensor)
-  local bytes_per_element = ffi.sizeof(string.match(tostring(ffi.typeof(tensor:data())), "<(.*)%*")) or 0
+  local dtype = string.match(tostring(ffi.typeof(tensor:data())), "<(.*)%*")
+  local bytes_per_element = ffi.sizeof(dtype) or 0
   return bytes_per_element * tensor:nElement()
 end
 
@@ -109,21 +110,27 @@ local byte_ptr = ffi.typeof("unsigned char *")
 `tensor` can be any torch Tensor type. Must be contiguous.
 ]]
 function snappy.compress(tensor)
-  assert(tensor:isContiguous(), "torch-snappy can only compress contiguous tensors")
+  assert(tensor:isContiguous(), "tensor must be contiguous")
   local tensor_data_size = data_size(tensor)
   local output_length = lib.snappy_max_compressed_length(tensor_data_size);
+
+  --[[ We could use an ffi buffer here, but it would consume the address
+  space of luajit. We can compress bigger objects if we use a temporary
+  ByteStorage instead. ]]
   local temp = torch.ByteStorage(tonumber(output_length))
   local buffer = temp:data()
 
   local compressed_size = ffi.new("size_t[1]", output_length)
-  local result = lib.snappy_compress(ffi.cast(byte_ptr, tensor:data()), tensor_data_size, buffer, compressed_size)
-  local compressed_data
-  if result == lib.SNAPPY_OK then
-    compressed_data = torch.ByteStorage(tonumber(compressed_size[0]))
-    ffi.copy(compressed_data:data(), buffer, compressed_size[0])
-  else
+  local result = lib.snappy_compress(ffi.cast(byte_ptr, tensor:data()),
+                                     tensor_data_size,
+                                     buffer,
+                                     compressed_size)
+  if result ~= lib.SNAPPY_OK then
     error("torch-snappy couldn't compress your tensor :(")
   end
+
+  local compressed_data = torch.ByteStorage(tonumber(compressed_size[0]))
+  ffi.copy(compressed_data:data(), buffer, compressed_size[0])
 
   local tensor_size = tensor:size()
   local tensor_new_f = tensor.new
@@ -141,9 +148,9 @@ end
     correct number of elements.
 ]]
 function snappy.decompress(bytes, tensor)
-  assert(bytes, "snappy.decompress needs bytes")
-  assert(tensor, "snappy.decompress needs dest tensor")
-  assert(tensor:isContiguous(), "snappy.decompress needs dest tensor to be contiguous")
+  assert(bytes, "snappy.decompress needs compressed bytes")
+  assert(tensor, "snappy.decompress needs target tensor")
+  assert(tensor:isContiguous(), "target tensor must be contiguous")
 
   local decompressed_size = ffi.new("size_t[1]", 0)
   local result = lib.snappy_uncompressed_length(bytes:data(),
